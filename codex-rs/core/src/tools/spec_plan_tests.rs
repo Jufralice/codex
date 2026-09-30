@@ -1460,6 +1460,82 @@ async fn sleep_tool_stays_direct_and_outside_code_mode() {
 }
 
 #[tokio::test]
+async fn deferred_tools_are_marked_for_provider_side_loading() {
+    let plan = probe_with(
+        |turn| {
+            update_turn_settings_for_test(turn, |settings| {
+                Arc::make_mut(&mut settings.model_info).supports_search_tool = true;
+            });
+        },
+        ToolPlanInputs {
+            tool_runtimes: vec![
+                mcp_runtime("registry", "mcp__registry", "direct", ToolExposure::Direct),
+                mcp_runtime(
+                    "registry",
+                    "mcp__registry",
+                    "deferred",
+                    ToolExposure::Deferred,
+                ),
+            ],
+            dynamic_tools: vec![
+                dynamic_tool(None, "direct_dynamic", /*defer_loading*/ false),
+                dynamic_tool(None, "deferred_dynamic", /*defer_loading*/ true),
+                dynamic_tool(Some("dyn"), "deferred_member", /*defer_loading*/ true),
+            ],
+            ..ToolPlanInputs::default()
+        },
+    )
+    .await;
+
+    let ToolSpec::Namespace(registry) = plan.visible_spec("mcp__registry") else {
+        panic!(
+            "expected the MCP namespace spec, got {:?}",
+            plan.visible_spec("mcp__registry")
+        );
+    };
+    let members = registry
+        .tools
+        .iter()
+        .map(|tool| match tool {
+            ResponsesApiNamespaceTool::Function(tool) => (tool.name.as_str(), tool.defer_loading),
+            ResponsesApiNamespaceTool::Custom(tool) => (tool.name.as_str(), tool.defer_loading),
+        })
+        .collect::<BTreeMap<_, _>>();
+    assert_eq!(
+        members,
+        BTreeMap::from([("deferred", Some(true)), ("direct", None),])
+    );
+
+    let ToolSpec::Function(dynamic) = plan.visible_spec("deferred_dynamic") else {
+        panic!("expected a function spec for the deferred dynamic tool");
+    };
+    assert_eq!(dynamic.defer_loading, Some(true));
+
+    let ToolSpec::Function(direct_dynamic) = plan.visible_spec("direct_dynamic") else {
+        panic!("expected a function spec for the direct dynamic tool");
+    };
+    assert_eq!(direct_dynamic.defer_loading, None);
+
+    let ToolSpec::Namespace(dynamic_namespace) = plan.visible_spec("dyn") else {
+        panic!("expected a namespace spec for the deferred dynamic namespace");
+    };
+    let deferred_members = dynamic_namespace
+        .tools
+        .iter()
+        .filter_map(|tool| match tool {
+            ResponsesApiNamespaceTool::Function(tool) => {
+                Some((tool.name.as_str(), tool.defer_loading))
+            }
+            ResponsesApiNamespaceTool::Custom(_) => None,
+        })
+        .collect::<BTreeMap<_, _>>();
+    assert_eq!(
+        deferred_members,
+        BTreeMap::from([("deferred_member", Some(true))])
+    );
+}
+
+#[tokio::test]
 async fn mcp_and_tool_search_follow_direct_and_deferred_tool_exposure() {
     let direct_mcp = probe_with(
         |_| {},
@@ -1646,7 +1722,9 @@ async fn tool_namespaces_info_is_opt_in_and_tracks_mcp_exposure() {
             namespace.functions.get("deferred"),
             Some(&TurnToolFunctionInfo {
                 name: "deferred".to_string(),
-                direct: false,
+                // Deferred tools now ship in the request marked with `defer_loading`, so they
+                // are model-visible while still being expanded only on `tool_search`.
+                direct: true,
                 code_mode_name: Some("mcp__registry__deferred".to_string()),
                 deferred: true,
                 source: TurnToolSource::Mcp {
@@ -2246,9 +2324,15 @@ async fn deferred_extension_tools_are_discoverable_with_tool_search() {
     .await;
 
     plan.assert_visible_contains(&["tool_search"]);
-    plan.assert_visible_lacks(&["extension_echo"]);
+    // Deferred tools stay in the request with `defer_loading` set so the provider can
+    // expand them only once `tool_search` selects them.
+    plan.assert_visible_contains(&["extension_echo"]);
     plan.assert_registered_contains(&["extension_echo"]);
     assert_eq!(plan.exposure("extension_echo"), ToolExposure::Deferred);
+    let ToolSpec::Function(extension_echo) = plan.visible_spec("extension_echo") else {
+        panic!("expected a function spec for the deferred extension tool");
+    };
+    assert_eq!(extension_echo.defer_loading, Some(true));
 }
 
 #[tokio::test]

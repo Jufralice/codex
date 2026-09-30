@@ -558,10 +558,11 @@ fn build_model_visible_specs(
     code_mode_tool_names: &BTreeMap<String, ToolName>,
     hosted_specs: Vec<ToolSpec>,
 ) -> Vec<ToolSpec> {
+    let namespace_tools = namespace_tools_enabled(turn_context);
     let mut specs = Vec::new();
     for tool in registry.entries() {
         let exposure = tool.exposure;
-        if !exposure.is_direct() {
+        if !exposure.is_direct() && !exposure.is_deferred() {
             continue;
         }
 
@@ -570,7 +571,10 @@ fn build_model_visible_specs(
             continue;
         }
 
-        let spec = tool.runtime.spec();
+        let mut spec = tool.runtime.spec();
+        if exposure.is_deferred() {
+            mark_spec_deferred(&mut spec);
+        }
         specs.push(spec_for_model_request(
             turn_context,
             model_info,
@@ -584,10 +588,29 @@ fn build_model_visible_specs(
 
     merge_into_namespaces(specs)
         .into_iter()
-        .filter(|spec| {
-            namespace_tools_enabled(turn_context) || !matches!(spec, ToolSpec::Namespace(_))
-        })
+        .filter(|spec| namespace_tools || !matches!(spec, ToolSpec::Namespace(_)))
         .collect()
+}
+
+/// Marks a deferred tool so the provider can defer loading it until `tool_search` selects it.
+///
+/// `defer_loading` belongs to the individual tools, not to the namespace wrapper: a namespace
+/// carries no such field, and providers expect the marker on each function inside it. Leaving
+/// this unset makes providers expand every deferred tool eagerly, which defeats tool search.
+fn mark_spec_deferred(spec: &mut ToolSpec) {
+    match spec {
+        ToolSpec::Function(tool) => tool.defer_loading = Some(true),
+        ToolSpec::Freeform(tool) => tool.defer_loading = Some(true),
+        ToolSpec::Namespace(namespace) => {
+            for member in &mut namespace.tools {
+                match member {
+                    ResponsesApiNamespaceTool::Function(tool) => tool.defer_loading = Some(true),
+                    ResponsesApiNamespaceTool::Custom(tool) => tool.defer_loading = Some(true),
+                }
+            }
+        }
+        ToolSpec::ToolSearch { .. } | ToolSpec::WebSearch { .. } => {}
+    }
 }
 
 fn spec_for_model_request(

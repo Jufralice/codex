@@ -432,7 +432,7 @@ async fn tools_without_handlers_do_not_support_parallel() -> anyhow::Result<()> 
 }
 
 #[tokio::test]
-async fn specs_filter_deferred_dynamic_tools() -> anyhow::Result<()> {
+async fn specs_mark_deferred_dynamic_tools_for_provider_side_loading() -> anyhow::Result<()> {
     let (_, turn) = make_session_and_context().await;
     let turn = Arc::new(turn);
     let step_context = StepContext::for_test(Arc::clone(&turn));
@@ -474,9 +474,18 @@ async fn specs_filter_deferred_dynamic_tools() -> anyhow::Result<()> {
     let visible_specs = router.model_visible_specs();
 
     assert!(Arc::ptr_eq(&visible_specs, &router.model_visible_specs()));
+    // Both tools ship in the request; only the deferred one is marked for provider-side loading.
+    let mut names = namespace_function_names(&visible_specs, "codex_app");
+    names.sort();
+    let mut expected = vec![hidden_tool.to_string(), visible_tool.to_string()];
+    expected.sort();
+    assert_eq!(names, expected);
     assert_eq!(
-        namespace_function_names(&visible_specs, "codex_app"),
-        vec![visible_tool.to_string()]
+        namespace_function_defer_loading(&visible_specs, "codex_app"),
+        BTreeMap::from([
+            (hidden_tool.to_string(), Some(true)),
+            (visible_tool.to_string(), None),
+        ])
     );
     assert_eq!(
         router.deferred_tool_namespaces(),
@@ -625,6 +634,36 @@ async fn extension_tool_executors_are_model_visible_and_dispatchable() -> anyhow
     }
 
     Ok(())
+}
+
+fn namespace_function_defer_loading(
+    specs: &[ToolSpec],
+    namespace_name: &str,
+) -> BTreeMap<String, Option<bool>> {
+    specs
+        .iter()
+        .find_map(|spec| match spec {
+            ToolSpec::Namespace(namespace) if namespace.name == namespace_name => Some(
+                namespace
+                    .tools
+                    .iter()
+                    .map(|tool| match tool {
+                        ResponsesApiNamespaceTool::Function(tool) => {
+                            (tool.name.clone(), tool.defer_loading)
+                        }
+                        ResponsesApiNamespaceTool::Custom(tool) => {
+                            (tool.name.clone(), tool.defer_loading)
+                        }
+                    })
+                    .collect(),
+            ),
+            ToolSpec::Function(_)
+            | ToolSpec::Freeform(_)
+            | ToolSpec::ToolSearch { .. }
+            | ToolSpec::WebSearch { .. }
+            | ToolSpec::Namespace(_) => None,
+        })
+        .unwrap_or_default()
 }
 
 fn namespace_function_names(specs: &[ToolSpec], namespace_name: &str) -> Vec<String> {
