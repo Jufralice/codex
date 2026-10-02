@@ -5,6 +5,7 @@ use crate::ResponsesApiNamespace;
 use crate::ResponsesApiNamespaceTool;
 use crate::ResponsesApiTool;
 use crate::default_namespace_description;
+use crate::tool_discovery::TOOL_SEARCH_TOOL_NAME;
 use codex_protocol::DEFAULT_FUNCTION_NAMESPACE;
 use codex_protocol::config_types::WebSearchContextSize;
 use codex_protocol::config_types::WebSearchFilters as ConfigWebSearchFilters;
@@ -63,6 +64,20 @@ impl ToolSpec {
             ToolSpec::ToolSearch { .. } => "tool_search",
             ToolSpec::WebSearch { .. } => "web_search",
             ToolSpec::Freeform(tool) => tool.name.as_str(),
+        }
+    }
+
+    /// Whether this spec is the tool search tool, in either wire form.
+    ///
+    /// Tool search is advertised either as a hosted `type: "tool_search"` tool or,
+    /// for providers that intercept that variant, as a plain function. Callers
+    /// that reason about tool search being *available* should use this rather
+    /// than matching on the variant.
+    pub fn is_tool_search(&self) -> bool {
+        match self {
+            ToolSpec::ToolSearch { .. } => true,
+            ToolSpec::Function(tool) => tool.name == TOOL_SEARCH_TOOL_NAME,
+            ToolSpec::Namespace(_) | ToolSpec::WebSearch { .. } | ToolSpec::Freeform(_) => false,
         }
     }
 }

@@ -60,8 +60,8 @@ pub(super) fn collect_tool_namespaces_info(
         }
 
         let tool_name = runtime.tool_name().with_default_namespace();
-        let is_tool_search = tool_name.name == TOOL_SEARCH_TOOL_NAME
-            && matches!(runtime.spec(), ToolSpec::ToolSearch { .. });
+        let is_tool_search =
+            tool_name.name == TOOL_SEARCH_TOOL_NAME && runtime.spec().is_tool_search();
         let (namespace_name, function_name) = if is_tool_search {
             (TOOL_SEARCH_TOOL_NAME, TOOL_SEARCH_FUNCTION_NAME)
         } else {

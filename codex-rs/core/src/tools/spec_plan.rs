@@ -50,6 +50,7 @@ use crate::tools::handlers::multi_agents_v2::SendMessageHandler as SendMessageHa
 use crate::tools::handlers::multi_agents_v2::SpawnAgentHandler as SpawnAgentHandlerV2;
 use crate::tools::handlers::multi_agents_v2::WaitAgentHandler as WaitAgentHandlerV2;
 use crate::tools::handlers::tool_search_spec::ToolSearchSourceListing;
+use crate::tools::handlers::tool_search_spec::tool_search_wire_mode;
 use crate::tools::handlers::view_image_spec::ViewImageToolOptions;
 use crate::tools::hosted_spec::WebSearchToolOptions;
 use crate::tools::hosted_spec::create_web_search_tool;
@@ -1478,7 +1479,11 @@ fn append_tool_search_executor(
     } else {
         ToolSearchSourceListing::Include
     };
-    let handler = tool_search_handler_cache.get_or_build(registry, source_listing);
+    let handler = tool_search_handler_cache.get_or_build(
+        registry,
+        source_listing,
+        tool_search_wire_mode(turn_context),
+    );
     registry.register_trusted(handler);
 }
 

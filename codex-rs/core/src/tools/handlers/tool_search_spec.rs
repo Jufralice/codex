@@ -1,4 +1,7 @@
+use crate::session::turn_context::TurnContext;
+use codex_features::Feature;
 use codex_tools::JsonSchema;
+use codex_tools::ResponsesApiTool;
 use codex_tools::TOOL_SEARCH_TOOL_NAME;
 use codex_tools::ToolSearchSourceInfo;
 use codex_tools::ToolSpec;
@@ -13,10 +16,33 @@ pub(crate) enum ToolSearchSourceListing {
     Omit,
 }
 
-pub(crate) fn create_tool_search_tool(
+/// How the tool search tool is advertised to the model.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ToolSearchWireMode {
+    /// Advertised as `type: "tool_search"`, matching the OpenAI Responses API.
+    Hosted,
+    /// Advertised as a plain `type: "function"` so providers that intercept the
+    /// hosted variant dispatch the call back to this client.
+    Function,
+}
+
+pub(crate) fn tool_search_wire_mode(turn_context: &TurnContext) -> ToolSearchWireMode {
+    if turn_context
+        .config
+        .features
+        .enabled(Feature::ClientSideToolSearch)
+    {
+        ToolSearchWireMode::Function
+    } else {
+        ToolSearchWireMode::Hosted
+    }
+}
+
+pub(crate) fn create_tool_search_tool_with_mode(
     searchable_sources: &[ToolSearchSourceInfo],
     default_limit: usize,
     source_listing: ToolSearchSourceListing,
+    wire_mode: ToolSearchWireMode,
 ) -> ToolSpec {
     let properties = BTreeMap::from([
         (
@@ -94,14 +120,25 @@ pub(crate) fn create_tool_search_tool(
         "# Tool discovery\n\nSearches over deferred tool metadata with BM25 and exposes matching tools for the next model call.{source_section}Some of the tools may not have been provided to you upfront, and you should use this tool (`{TOOL_SEARCH_TOOL_NAME}`) to search for the required tools. For MCP tool discovery, always use `{TOOL_SEARCH_TOOL_NAME}` instead of `list_mcp_resources` or `list_mcp_resource_templates`."
     );
 
-    ToolSpec::ToolSearch {
-        execution: "client".to_string(),
-        description,
-        parameters: JsonSchema::object(
-            properties,
-            Some(vec!["query".to_string()]),
-            Some(false.into()),
-        ),
+    let parameters = JsonSchema::object(
+        properties,
+        Some(vec!["query".to_string()]),
+        Some(false.into()),
+    );
+    match wire_mode {
+        ToolSearchWireMode::Hosted => ToolSpec::ToolSearch {
+            execution: "client".to_string(),
+            description,
+            parameters,
+        },
+        ToolSearchWireMode::Function => ToolSpec::Function(ResponsesApiTool {
+            name: TOOL_SEARCH_TOOL_NAME.to_string(),
+            description,
+            strict: false,
+            defer_loading: None,
+            parameters,
+            output_schema: None,
+        }),
     }
 }
 
@@ -115,7 +152,7 @@ mod tests {
     #[test]
     fn create_tool_search_tool_deduplicates_and_renders_enabled_sources() {
         assert_eq!(
-            create_tool_search_tool(
+            create_tool_search_tool_with_mode(
                 &[
                     ToolSearchSourceInfo {
                         name: "Google Drive".to_string(),
@@ -135,6 +172,7 @@ mod tests {
                 ],
                 /*default_limit*/ 8,
                 ToolSearchSourceListing::Include,
+                ToolSearchWireMode::Hosted,
             ),
             ToolSpec::ToolSearch {
                 execution: "client".to_string(),
@@ -158,13 +196,14 @@ mod tests {
 
     #[test]
     fn create_tool_search_tool_omits_sources_when_world_state_advertises_them() {
-        let ToolSpec::ToolSearch { description, .. } = create_tool_search_tool(
+        let ToolSpec::ToolSearch { description, .. } = create_tool_search_tool_with_mode(
             &[ToolSearchSourceInfo {
                 name: "Google Drive".to_string(),
                 description: Some("Search files and documents.".to_string()),
             }],
             /*default_limit*/ 8,
             ToolSearchSourceListing::Omit,
+            ToolSearchWireMode::Hosted,
         ) else {
             panic!("expected tool search spec");
         };
@@ -183,10 +222,11 @@ mod tests {
                 description: Some(long_description.clone()),
             })
             .collect::<Vec<_>>();
-        let ToolSpec::ToolSearch { description, .. } = create_tool_search_tool(
+        let ToolSpec::ToolSearch { description, .. } = create_tool_search_tool_with_mode(
             &sources,
             /*default_limit*/ 8,
             ToolSearchSourceListing::Include,
+            ToolSearchWireMode::Hosted,
         ) else {
             panic!("expected tool search spec");
         };
@@ -217,5 +257,55 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(advertised_names, expected_names);
         assert!(description.contains("always use `tool_search`"));
+    }
+
+    #[test]
+    fn function_wire_mode_emits_a_plain_function_spec() {
+        let spec = create_tool_search_tool_with_mode(
+            &[ToolSearchSourceInfo {
+                name: "Google Drive".to_string(),
+                description: Some("Search files and documents.".to_string()),
+            }],
+            /*default_limit*/ 8,
+            ToolSearchSourceListing::Omit,
+            ToolSearchWireMode::Function,
+        );
+
+        let ToolSpec::Function(tool) = &spec else {
+            panic!("expected a function spec, got {spec:?}");
+        };
+        assert_eq!(tool.name, TOOL_SEARCH_TOOL_NAME);
+        assert!(
+            tool.description
+                .contains("use this tool (`tool_search`) to search")
+        );
+        assert_eq!(tool.strict, /*strict*/ false);
+        assert_eq!(tool.defer_loading, None);
+
+        // The function-typed spec must serialize as a plain Responses function so
+        // providers do not intercept it as a hosted tool_search.
+        let json = serde_json::to_value(&spec).expect("spec should serialize");
+        assert_eq!(
+            json.get("type").and_then(|value| value.as_str()),
+            Some("function")
+        );
+        assert_eq!(
+            json.get("name").and_then(|value| value.as_str()),
+            Some(TOOL_SEARCH_TOOL_NAME)
+        );
+        assert!(json.get("execution").is_none());
+    }
+
+    #[test]
+    fn hosted_wire_mode_emits_a_tool_search_spec() {
+        let spec = create_tool_search_tool_with_mode(
+            &[],
+            /*default_limit*/ 8,
+            ToolSearchSourceListing::Omit,
+            ToolSearchWireMode::Hosted,
+        );
+
+        assert!(matches!(spec, ToolSpec::ToolSearch { .. }));
+        assert!(spec.is_tool_search());
     }
 }

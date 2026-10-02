@@ -197,7 +197,7 @@ impl ToolRouter {
         }
         self.model_visible_specs
             .iter()
-            .any(|spec| matches!(spec, ToolSpec::ToolSearch { .. }))
+            .any(|spec| spec.is_tool_search())
             && self.registry.entries().any(|tool| {
                 tool.exposure.is_deferred()
                     && tool.runtime.tool_name().with_default_namespace() == name

@@ -4,7 +4,8 @@ use crate::tools::context::ToolPayload;
 use crate::tools::context::ToolSearchOutput;
 use crate::tools::context::boxed_tool_output;
 use crate::tools::handlers::tool_search_spec::ToolSearchSourceListing;
-use crate::tools::handlers::tool_search_spec::create_tool_search_tool;
+use crate::tools::handlers::tool_search_spec::ToolSearchWireMode;
+use crate::tools::handlers::tool_search_spec::create_tool_search_tool_with_mode;
 use crate::tools::registry::CoreToolRuntime;
 use crate::tools::registry::ToolExecutor;
 use crate::tools::registry::ToolRegistry;
@@ -13,6 +14,7 @@ use bm25::Language;
 use bm25::SearchEngine;
 use bm25::SearchEngineBuilder;
 use codex_prompts::ResolvedModelMessages;
+use codex_protocol::models::SearchToolCallParams;
 use codex_tools::IndirectNamespacePrefixes;
 use codex_tools::LoadableToolSpec;
 use codex_tools::TOOL_SEARCH_DEFAULT_LIMIT;
@@ -42,6 +44,7 @@ pub(crate) struct ToolSearchHandlerCache {
 struct CachedToolSearchHandler {
     handler: Arc<ToolSearchHandler>,
     sources: Vec<ToolSearchSource>,
+    wire_mode: ToolSearchWireMode,
 }
 
 enum ToolSearchSource {
@@ -55,6 +58,7 @@ impl ToolSearchHandlerCache {
         &self,
         registry: &ToolRegistry,
         source_listing: ToolSearchSourceListing,
+        wire_mode: ToolSearchWireMode,
     ) -> Arc<ToolSearchHandler> {
         let sources = registry
             .entries()
@@ -75,6 +79,7 @@ impl ToolSearchHandlerCache {
             let cached = self.cached();
             if let Some(cached) = cached.as_ref()
                 && cached.handler.source_listing == source_listing
+                && cached.wire_mode == wire_mode
                 && Self::sources_match(&cached.sources, &sources)
             {
                 return Arc::clone(&cached.handler);
@@ -91,10 +96,15 @@ impl ToolSearchHandlerCache {
             })
             .collect();
 
-        let handler = Arc::new(ToolSearchHandler::new(search_infos, source_listing));
+        let handler = Arc::new(ToolSearchHandler::new(
+            search_infos,
+            source_listing,
+            wire_mode,
+        ));
         let mut cached = self.cached();
         if let Some(cached) = cached.as_ref()
             && cached.handler.source_listing == source_listing
+            && cached.wire_mode == wire_mode
             && Self::sources_match(&cached.sources, &sources)
         {
             return Arc::clone(&cached.handler);
@@ -102,6 +112,7 @@ impl ToolSearchHandlerCache {
         *cached = Some(CachedToolSearchHandler {
             handler: Arc::clone(&handler),
             sources,
+            wire_mode,
         });
         handler
     }
@@ -140,15 +151,17 @@ impl ToolSearchHandler {
     pub(crate) fn new(
         search_infos: Vec<ToolSearchInfo>,
         source_listing: ToolSearchSourceListing,
+        wire_mode: ToolSearchWireMode,
     ) -> Self {
         let search_source_infos = search_infos
             .iter()
             .filter_map(|search_info| search_info.source_info.clone())
             .collect::<Vec<_>>();
-        let spec = create_tool_search_tool(
+        let spec = create_tool_search_tool_with_mode(
             &search_source_infos,
             TOOL_SEARCH_DEFAULT_LIMIT,
             source_listing,
+            wire_mode,
         );
         let documents: Vec<Document<usize>> = search_infos
             .iter()
@@ -200,8 +213,20 @@ impl ToolSearchHandler {
             ..
         } = invocation;
 
-        let args = match payload {
-            ToolPayload::ToolSearch { arguments } => arguments,
+        let args = match &payload {
+            ToolPayload::ToolSearch { arguments } => arguments.clone(),
+            ToolPayload::Function { arguments } => {
+                // Providers that advertise tool search as a plain function return
+                // the arguments as a JSON string rather than a typed object.
+                match serde_json::from_str::<SearchToolCallParams>(arguments) {
+                    Ok(arguments) => arguments,
+                    Err(err) => {
+                        return Err(FunctionCallError::RespondToModel(format!(
+                            "failed to parse {TOOL_SEARCH_TOOL_NAME} arguments: {err}"
+                        )));
+                    }
+                }
+            }
             _ => {
                 return Err(FunctionCallError::Fatal(format!(
                     "{TOOL_SEARCH_TOOL_NAME} handler received unsupported payload"
@@ -294,11 +319,23 @@ mod tests {
         let mut registry = ToolRegistry::default();
         registry.register_trusted_with_exposure(Arc::clone(&runtime), ToolExposure::Deferred);
 
-        let first = cache.get_or_build(&registry, ToolSearchSourceListing::Include);
-        let second = cache.get_or_build(&registry, ToolSearchSourceListing::Include);
+        let first = cache.get_or_build(
+            &registry,
+            ToolSearchSourceListing::Include,
+            ToolSearchWireMode::Hosted,
+        );
+        let second = cache.get_or_build(
+            &registry,
+            ToolSearchSourceListing::Include,
+            ToolSearchWireMode::Hosted,
+        );
         assert!(Arc::ptr_eq(&first, &second));
 
-        let without_sources = cache.get_or_build(&registry, ToolSearchSourceListing::Omit);
+        let without_sources = cache.get_or_build(
+            &registry,
+            ToolSearchSourceListing::Omit,
+            ToolSearchWireMode::Hosted,
+        );
         assert!(!Arc::ptr_eq(&first, &without_sources));
 
         let mut replacement_registry = ToolRegistry::default();
@@ -307,12 +344,20 @@ mod tests {
                 .expect("replacement MCP tool should convert"),
         );
         replacement_registry.register_trusted_with_exposure(replacement, ToolExposure::Deferred);
-        let replacement = cache.get_or_build(&replacement_registry, ToolSearchSourceListing::Omit);
+        let replacement = cache.get_or_build(
+            &replacement_registry,
+            ToolSearchSourceListing::Omit,
+            ToolSearchWireMode::Hosted,
+        );
         assert!(!Arc::ptr_eq(&without_sources, &replacement));
 
         let mut disabled_registry = ToolRegistry::default();
         disabled_registry.register_trusted_with_exposure(runtime, ToolExposure::Direct);
-        let disabled = cache.get_or_build(&disabled_registry, ToolSearchSourceListing::Omit);
+        let disabled = cache.get_or_build(
+            &disabled_registry,
+            ToolSearchSourceListing::Omit,
+            ToolSearchWireMode::Hosted,
+        );
         assert!(!Arc::ptr_eq(&replacement, &disabled));
         assert!(disabled.search_infos.is_empty());
     }
@@ -338,7 +383,11 @@ mod tests {
             Arc::new(DynamicToolHandler::new(&dynamic_tool).expect("dynamic tool should convert")),
             ToolExposure::Deferred,
         );
-        let first = cache.get_or_build(&first_registry, ToolSearchSourceListing::Include);
+        let first = cache.get_or_build(
+            &first_registry,
+            ToolSearchSourceListing::Include,
+            ToolSearchWireMode::Hosted,
+        );
 
         let mut equivalent_registry = ToolRegistry::default();
         equivalent_registry
@@ -347,7 +396,11 @@ mod tests {
             Arc::new(DynamicToolHandler::new(&dynamic_tool).expect("dynamic tool should convert")),
             ToolExposure::Deferred,
         );
-        let equivalent = cache.get_or_build(&equivalent_registry, ToolSearchSourceListing::Include);
+        let equivalent = cache.get_or_build(
+            &equivalent_registry,
+            ToolSearchSourceListing::Include,
+            ToolSearchWireMode::Hosted,
+        );
         assert!(Arc::ptr_eq(&first, &equivalent));
 
         dynamic_tool.description = "Search refreshed records".to_string();
@@ -357,7 +410,11 @@ mod tests {
             Arc::new(DynamicToolHandler::new(&dynamic_tool).expect("dynamic tool should convert")),
             ToolExposure::Deferred,
         );
-        let refreshed = cache.get_or_build(&refreshed_registry, ToolSearchSourceListing::Include);
+        let refreshed = cache.get_or_build(
+            &refreshed_registry,
+            ToolSearchSourceListing::Include,
+            ToolSearchWireMode::Hosted,
+        );
         assert!(!Arc::ptr_eq(&first, &refreshed));
         assert!(
             refreshed.search_infos[1]
@@ -406,7 +463,11 @@ mod tests {
                 .search_info()
                 .expect("dynamic handler should return search info")
         }));
-        let handler = ToolSearchHandler::new(search_infos, ToolSearchSourceListing::Include);
+        let handler = ToolSearchHandler::new(
+            search_infos,
+            ToolSearchSourceListing::Include,
+            ToolSearchWireMode::Hosted,
+        );
         let results = [
             &handler.search_infos[0].entry,
             &handler.search_infos[2].entry,

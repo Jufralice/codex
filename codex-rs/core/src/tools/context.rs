@@ -237,7 +237,24 @@ impl ToolOutput for ToolSearchOutput {
         true
     }
 
-    fn to_response_item(&self, call_id: &str, _payload: &ToolPayload) -> ResponseInputItem {
+    fn to_response_item(&self, call_id: &str, payload: &ToolPayload) -> ResponseInputItem {
+        // When tool search is advertised as a plain function, the model returns a
+        // `function_call`, so the matching output must be a `function_call_output`.
+        if matches!(payload, ToolPayload::Function { .. }) {
+            let tools = self
+                .tools
+                .iter()
+                .map(|tool| {
+                    serde_json::to_value(tool).unwrap_or_else(|err| {
+                        JsonValue::String(format!("failed to serialize tool_search output: {err}"))
+                    })
+                })
+                .collect();
+            return ResponseInputItem::FunctionCallOutput {
+                call_id: call_id.to_string(),
+                output: FunctionCallOutputPayload::from_text(JsonValue::Array(tools).to_string()),
+            };
+        }
         ResponseInputItem::ToolSearchOutput {
             call_id: call_id.to_string(),
             status: "completed".to_string(),

@@ -246,6 +246,10 @@ pub enum Feature {
     ToolSearchAlwaysDeferMcpTools,
     /// Describe deferred tool namespaces in the model-visible world state.
     DeferredToolWorldState,
+    /// Advertise the tool search tool as a plain function instead of a
+    /// `tool_search` tool so providers that intercept the hosted variant can
+    /// dispatch the search back to the client.
+    ClientSideToolSearch,
     /// Expose MCP model-visible namespaces without the legacy `mcp__` prefix.
     NonPrefixedMcpToolNames,
     /// Enable discoverable tool suggestions for apps.
@@ -1465,6 +1469,12 @@ pub const FEATURES: &[FeatureSpec] = &[
     FeatureSpec {
         id: Feature::DeferredToolWorldState,
         key: "deferred_tool_world_state",
+        stage: Stage::UnderDevelopment,
+        default_enabled: false,
+    },
+    FeatureSpec {
+        id: Feature::ClientSideToolSearch,
+        key: "client_side_tool_search",
         stage: Stage::UnderDevelopment,
         default_enabled: false,
     },
